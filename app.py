@@ -22,22 +22,6 @@ from recommenders.evaluation.python_evaluation import map_at_k, ndcg_at_k
 from recommenders.models.sar import SAR
 from recommenders.utils.timer import Timer
 
-# Try to import Spark and ALS
-try:
-    from recommenders.utils.spark_utils import start_or_get_spark
-    from recommenders.datasets.spark_splitters import spark_random_split
-    from recommenders.evaluation.spark_evaluation import SparkRatingEvaluation
-    from recommenders.models.als import ALSWrap
-    from pyspark.sql import SparkSession
-    SPARK_AVAILABLE = True
-except ImportError:
-    SPARK_AVAILABLE = False
-    start_or_get_spark = None
-    spark_random_split = None
-    SparkRatingEvaluation = None
-    ALSWrap = None
-    SparkSession = None
-
 # BiVAE predictions availability flag
 BIVAE_AVAILABLE = True  # Will be set to False if predictions file not found
 
@@ -65,8 +49,9 @@ TMDB_API_KEY = "8d50cb61259ff8679ebb46e0e4da34a6" # Set your TMDb API key here i
 TMDB_IMAGE_BASE_URL = "https://image.tmdb.org/t/p/w185"
 PLACEHOLDER_IMAGE_URL = "https://via.placeholder.com/185x278/FF6B6B/FFFFFF?text=No+Poster"
 
-# BiVAE predictions configuration
+# Pre-computed predictions configuration
 BIVAE_PREDICTIONS_PATH = "./saved_models/bivae_predictions.pkl"  # Path to saved BiVAE predictions
+ALS_PREDICTIONS_PATH = "./top_all_recommendations.parquet"  # Path to saved ALS predictions (parquet directory)
 
 # Custom CSS
 st.markdown("""
@@ -411,17 +396,52 @@ def train_sar_model(train_df):
     return model
 
 
-@st.cache_resource
-def get_spark_session():
-    """Initialize and return Spark session."""
-    if not SPARK_AVAILABLE:
-        return None
+@st.cache_data
+def load_als_predictions():
+    """Load pre-computed ALS predictions from parquet file.
+    
+    Returns a DataFrame with columns: UserId, MovieId, prediction
+    """
     try:
-        spark = start_or_get_spark("MovieRecommender", memory="4g")
-        return spark
-    except Exception as e:
-        st.error(f"Failed to initialize Spark: {str(e)}")
+        all_predictions = pd.read_parquet(ALS_PREDICTIONS_PATH)
+        return all_predictions
+    except FileNotFoundError:
         return None
+    except Exception as e:
+        st.error(f"Failed to load ALS predictions: {str(e)}")
+        return None
+
+
+def get_als_recommendations_for_user(als_predictions, user_id, top_k=TOP_K):
+    """Get top-K recommendations for a specific user from ALS predictions.
+    
+    Args:
+        als_predictions: DataFrame with all predictions (UserId, MovieId, prediction)
+        user_id: User ID to get recommendations for
+        top_k: Number of recommendations to return
+        
+    Returns:
+        DataFrame with columns: MovieId, score, rank
+    """
+    if als_predictions is None:
+        return None
+    
+    # Filter predictions for the specific user
+    user_preds = als_predictions[als_predictions[COL_USER] == user_id].copy()
+    
+    if len(user_preds) == 0:
+        return None
+    
+    # Sort by prediction score and get top-K
+    user_preds = user_preds.nlargest(top_k, COL_PREDICTION)
+    
+    # Format output
+    recs = user_preds[[COL_ITEM, COL_PREDICTION]].copy()
+    recs = recs.rename(columns={COL_PREDICTION: 'score'})
+    recs['rank'] = range(1, len(recs) + 1)
+    recs = recs.reset_index(drop=True)
+    
+    return recs
 
 
 @st.cache_data
@@ -487,41 +507,6 @@ def get_bivae_recommendations_for_user(bivae_predictions, user_id, top_k=TOP_K):
     return recs
 
 
-@st.cache_resource
-def train_als_model(_train_df):
-    """Train ALS model using Spark. Cached to avoid retraining."""
-    if not SPARK_AVAILABLE:
-        return None
-    
-    spark = get_spark_session()
-    if spark is None:
-        return None
-    
-    try:
-        # Convert pandas to Spark DataFrame
-        train_spark = spark.createDataFrame(_train_df)
-        
-        # Initialize ALS model
-        model = ALSWrap(
-            col_user=COL_USER,
-            col_item=COL_ITEM,
-            col_rating=COL_RATING,
-            rank=10,
-            maxIter=15,
-            regParam=0.05,
-            coldStartStrategy='drop'
-        )
-        
-        # Train the model
-        with st.spinner('Training ALS model (this will be cached for future use)...'):
-            model.fit(train_spark)
-        
-        return model
-    except Exception as e:
-        st.error(f"Failed to train ALS model: {str(e)}")
-        return None
-
-
 def evaluate_model(test_df, predictions, model_name):
     """Evaluate model and return metrics."""
     map_score = map_at_k(
@@ -564,13 +549,12 @@ def main():
     df, movie_df = load_data()
     train_df, test_df = split_data(df)
     
-    # Pretrain ALS model if Spark is available (cached, only runs once)
-    if SPARK_AVAILABLE:
-        als_model = train_als_model(train_df)
-        if als_model is not None:
-            st.sidebar.success("✅ ALS model ready")
+    # Load ALS predictions if available (cached, only loads once)
+    als_predictions = load_als_predictions()
+    if als_predictions is not None:
+        st.sidebar.success("✅ ALS predictions loaded")
     else:
-        als_model = None
+        st.sidebar.info(f"ℹ️ ALS predictions not found at {ALS_PREDICTIONS_PATH}")
     
     # Load BiVAE predictions if available (cached, only loads once)
     bivae_predictions = load_bivae_predictions()
@@ -593,10 +577,10 @@ def main():
         show_home_page(df, movie_df)
     
     elif page == "🎯 Get Recommendations":
-        show_recommendations_page(train_df, test_df, df, movie_df, als_model, bivae_predictions)
+        show_recommendations_page(train_df, test_df, df, movie_df, als_predictions, bivae_predictions)
     
     elif page == "📊 Model Evaluation":
-        show_evaluation_page(train_df, test_df, als_model, bivae_predictions)
+        show_evaluation_page(train_df, test_df, als_predictions, bivae_predictions)
     
     elif page == "ℹ️ About":
         show_about_page()
@@ -623,7 +607,7 @@ def show_home_page(df, movie_df):
         3. **ALS (Matrix Factorization)** ⚡
            - Matrix factorization
            - Learns latent factors
-           - Best personalization (requires PySpark)
+           - Best personalization
         
         4. **BiVAE (Deep Learning)** 🧠
            - Bilateral Variational Autoencoder
@@ -722,14 +706,14 @@ def show_home_page(df, movie_df):
             st.markdown(f"**Movie {row[COL_ITEM]}** - ⭐ {row['rating_avg']:.2f} ({int(row['rating_count'])} ratings)")
 
 
-def show_recommendations_page(train_df, test_df, df, movie_df, als_model=None, bivae_predictions=None):
+def show_recommendations_page(train_df, test_df, df, movie_df, als_predictions=None, bivae_predictions=None):
     """Display recommendations page."""
     
     st.markdown("## 🎯 Get Personalized Recommendations")
     
     # Algorithm selection
     available_algorithms = ["Popularity-Based", "Item-KNN (SAR)"]
-    if SPARK_AVAILABLE:
+    if als_predictions is not None:
         available_algorithms.append("ALS (Matrix Factorization)")
     if bivae_predictions is not None:
         available_algorithms.append("BiVAE (Deep Learning)")
@@ -738,10 +722,6 @@ def show_recommendations_page(train_df, test_df, df, movie_df, als_model=None, b
         "Choose Algorithm:",
         available_algorithms
     )
-    
-    # Show warning if ALS is not available
-    if not SPARK_AVAILABLE:
-        st.info("ℹ️ ALS algorithm requires PySpark. Install it with: `pip install pyspark`")
     
     # User selection
     users = sorted(df[COL_USER].unique())
@@ -780,35 +760,21 @@ def show_recommendations_page(train_df, test_df, df, movie_df, als_model=None, b
                     recs = pop_model.recommend_for_user(selected_user, top_k=num_recs)
                     
             elif algorithm == "ALS (Matrix Factorization)":
-                if als_model is None:
-                    st.error("ALS model is not available. Please ensure PySpark is installed and the model trained successfully.")
+                if als_predictions is None:
+                    st.error("ALS predictions are not available. Please ensure the predictions file is loaded.")
                     st.stop()
                 
                 # Get user's history for context
                 user_history = train_df[train_df[COL_USER] == selected_user]
                 
                 if len(user_history) > 0:
-                    spark = get_spark_session()
-                    if spark is None:
-                        st.error("Cannot get Spark session.")
-                        st.stop()
+                    # Get recommendations from pre-computed ALS predictions
+                    recs = get_als_recommendations_for_user(als_predictions, selected_user, top_k=num_recs)
                     
-                    # Create test dataframe for single user
-                    test_user_df = spark.createDataFrame(
-                        pd.DataFrame({COL_USER: [selected_user]})
-                    )
-                    
-                    # Get recommendations using pretrained model
-                    recs_spark = als_model.recommend_k_items(
-                        test_user_df,
-                        top_k=num_recs,
-                        remove_seen=True
-                    )
-                    
-                    # Convert to pandas
-                    recs = recs_spark.toPandas()
-                    recs = recs.rename(columns={COL_PREDICTION: 'score'})
-                    recs['rank'] = range(1, len(recs) + 1)
+                    if recs is None or len(recs) == 0:
+                        st.warning(f"User {selected_user} not found in ALS predictions. Showing popular items instead.")
+                        pop_model = train_popularity_model(train_df)
+                        recs = pop_model.recommend_for_user(selected_user, top_k=num_recs)
                 else:
                     st.warning(f"User {selected_user} has no ratings in training set. Showing popular items instead.")
                     pop_model = train_popularity_model(train_df)
@@ -998,7 +964,7 @@ def show_recommendations_page(train_df, test_df, df, movie_df, als_model=None, b
             st.info(f"User {selected_user} has no ratings in the dataset.")
 
 
-def show_evaluation_page(train_df, test_df, als_model=None, bivae_predictions=None):
+def show_evaluation_page(train_df, test_df, als_predictions=None, bivae_predictions=None):
     """Display evaluation page."""
     
     st.markdown("## 📊 Model Evaluation & Comparison")
@@ -1035,33 +1001,24 @@ def show_evaluation_page(train_df, test_df, als_model=None, bivae_predictions=No
             st.success(f"✅ Item-KNN: MAP@{TOP_K}={sar_results['map']:.4f}, NDCG@{TOP_K}={sar_results['ndcg']:.4f}")
         
         # Evaluate ALS if available
-        if SPARK_AVAILABLE and als_model is not None:
+        if als_predictions is not None:
             with st.spinner('Evaluating ALS model...'):
-                spark = get_spark_session()
-                if spark is not None:
-                    try:
-                        with Timer() as pred_time:
-                            test_spark = spark.createDataFrame(test_df)
-                            als_predictions_spark = als_model.recommend_k_items(
-                                test_spark,
-                                top_k=TOP_K,
-                                remove_seen=True
-                            )
-                            als_predictions = als_predictions_spark.toPandas()
-                        
-                        als_results = evaluate_model(test_df, als_predictions, "ALS")
-                        als_results['pred_time'] = pred_time.interval
-                        results.append(als_results)
-                        
-                        st.success(f"✅ ALS: MAP@{TOP_K}={als_results['map']:.4f}, NDCG@{TOP_K}={als_results['ndcg']:.4f}")
-                    except Exception as e:
-                        st.warning(f"⚠️ ALS evaluation failed: {str(e)}")
-                else:
-                    st.warning("⚠️ Spark session could not be initialized. Skipping ALS evaluation.")
-        elif SPARK_AVAILABLE and als_model is None:
-            st.warning("⚠️ ALS model not available. Skipping ALS evaluation.")
+                try:
+                    with Timer() as pred_time:
+                        # ALS predictions are already computed, just filter for top-K
+                        als_topk = als_predictions.groupby(COL_USER).apply(
+                            lambda x: x.nlargest(TOP_K, COL_PREDICTION)
+                        ).reset_index(drop=True)
+                    
+                    als_results = evaluate_model(test_df, als_topk, "ALS")
+                    als_results['pred_time'] = pred_time.interval
+                    results.append(als_results)
+                    
+                    st.success(f"✅ ALS: MAP@{TOP_K}={als_results['map']:.4f}, NDCG@{TOP_K}={als_results['ndcg']:.4f}")
+                except Exception as e:
+                    st.warning(f"⚠️ ALS evaluation failed: {str(e)}")
         else:
-            st.info("ℹ️ ALS evaluation skipped (PySpark not installed)")
+            st.info("ℹ️ ALS evaluation skipped (predictions not loaded)")
         
         # Evaluate BiVAE if available
         if bivae_predictions is not None:
@@ -1194,8 +1151,8 @@ def show_about_page():
     - **Type**: Matrix factorization
     - **Approach**: Learns latent factors for users and items
     - **Pros**: Best personalization, handles sparsity well
-    - **Cons**: Computationally expensive, requires PySpark
-    - **Status**: Available (requires PySpark installation)
+    - **Cons**: Computationally expensive for training
+    - **Status**: Available (uses pre-computed predictions)
     
     #### 4. BiVAE (Bilateral Variational Autoencoder)
     - **Type**: Deep learning / Variational autoencoder
