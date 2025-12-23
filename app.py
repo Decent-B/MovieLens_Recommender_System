@@ -38,6 +38,9 @@ except ImportError:
     ALSWrap = None
     SparkSession = None
 
+# BiVAE predictions availability flag
+BIVAE_AVAILABLE = True  # Will be set to False if predictions file not found
+
 # Page configuration
 st.set_page_config(
     page_title="Movie Recommendation System",
@@ -48,7 +51,7 @@ st.set_page_config(
 
 # Constants
 TOP_K = 10
-MOVIELENS_DATA_SIZE = '100k'  # Start with 100k for faster demo, can change to 20m
+MOVIELENS_DATA_SIZE = '20m'  # Start with 100k for faster demo, can change to 20m
 COL_USER = "UserId"
 COL_ITEM = "MovieId"
 COL_RATING = "Rating"
@@ -61,6 +64,9 @@ RANDOM_SEED = 42
 TMDB_API_KEY = "8d50cb61259ff8679ebb46e0e4da34a6" # Set your TMDb API key here if available
 TMDB_IMAGE_BASE_URL = "https://image.tmdb.org/t/p/w185"
 PLACEHOLDER_IMAGE_URL = "https://via.placeholder.com/185x278/FF6B6B/FFFFFF?text=No+Poster"
+
+# BiVAE predictions configuration
+BIVAE_PREDICTIONS_PATH = "./saved_models/bivae_predictions.pkl"  # Path to saved BiVAE predictions
 
 # Custom CSS
 st.markdown("""
@@ -285,6 +291,14 @@ def load_data():
             header=[COL_USER, COL_ITEM, COL_RATING, COL_TIMESTAMP]
         )
         
+        # Keep only top 10,000 users with the most ratings for faster inference
+        TOP_N_USERS = 10000
+        user_counts = df.groupby(COL_USER).size().reset_index(name='count')
+        top_users = user_counts.nlargest(TOP_N_USERS, 'count')[COL_USER]
+        df = df[df[COL_USER].isin(top_users)]
+        
+        st.info(f"📊 Filtered to top {TOP_N_USERS:,} users | Total ratings: {len(df):,} | Unique items: {df[COL_ITEM].nunique():,}")
+        
         # Load movie metadata with titles and genres
         try:
             # Load movie metadata including genres
@@ -410,6 +424,69 @@ def get_spark_session():
         return None
 
 
+@st.cache_data
+def load_bivae_predictions():
+    """Load pre-computed BiVAE predictions from pickle file.
+    
+    Returns a DataFrame with columns: UserId, MovieId, prediction
+    """
+    try:
+        with open(BIVAE_PREDICTIONS_PATH, 'rb') as f:
+            all_predictions = pickle.load(f)
+        
+        # Rename columns to match app convention if needed
+        column_mapping = {}
+        if 'userID' in all_predictions.columns:
+            column_mapping['userID'] = COL_USER
+        if 'itemID' in all_predictions.columns:
+            column_mapping['itemID'] = COL_ITEM
+        if column_mapping:
+            all_predictions = all_predictions.rename(columns=column_mapping)
+        
+        # Ensure prediction column exists
+        if 'prediction' in all_predictions.columns and COL_PREDICTION != 'prediction':
+            all_predictions = all_predictions.rename(columns={'prediction': COL_PREDICTION})
+        
+        return all_predictions
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        st.error(f"Failed to load BiVAE predictions: {str(e)}")
+        return None
+
+
+def get_bivae_recommendations_for_user(bivae_predictions, user_id, top_k=TOP_K):
+    """Get top-K recommendations for a specific user from BiVAE predictions.
+    
+    Args:
+        bivae_predictions: DataFrame with all predictions (UserId, MovieId, prediction)
+        user_id: User ID to get recommendations for
+        top_k: Number of recommendations to return
+        
+    Returns:
+        DataFrame with columns: MovieId, score, rank
+    """
+    if bivae_predictions is None:
+        return None
+    
+    # Filter predictions for the specific user
+    user_preds = bivae_predictions[bivae_predictions[COL_USER] == user_id].copy()
+    
+    if len(user_preds) == 0:
+        return None
+    
+    # Sort by prediction score and get top-K
+    user_preds = user_preds.nlargest(top_k, COL_PREDICTION)
+    
+    # Format output
+    recs = user_preds[[COL_ITEM, COL_PREDICTION]].copy()
+    recs = recs.rename(columns={COL_PREDICTION: 'score'})
+    recs['rank'] = range(1, len(recs) + 1)
+    recs = recs.reset_index(drop=True)
+    
+    return recs
+
+
 @st.cache_resource
 def train_als_model(_train_df):
     """Train ALS model using Spark. Cached to avoid retraining."""
@@ -495,6 +572,13 @@ def main():
     else:
         als_model = None
     
+    # Load BiVAE predictions if available (cached, only loads once)
+    bivae_predictions = load_bivae_predictions()
+    if bivae_predictions is not None:
+        st.sidebar.success("✅ BiVAE predictions loaded")
+    else:
+        st.sidebar.info(f"ℹ️ BiVAE predictions not found at {BIVAE_PREDICTIONS_PATH}")
+    
     # Dataset info in sidebar
     st.sidebar.markdown("---")
     st.sidebar.markdown("### 📊 Dataset Info")
@@ -509,10 +593,10 @@ def main():
         show_home_page(df, movie_df)
     
     elif page == "🎯 Get Recommendations":
-        show_recommendations_page(train_df, test_df, df, movie_df, als_model)
+        show_recommendations_page(train_df, test_df, df, movie_df, als_model, bivae_predictions)
     
     elif page == "📊 Model Evaluation":
-        show_evaluation_page(train_df, test_df, als_model)
+        show_evaluation_page(train_df, test_df, als_model, bivae_predictions)
     
     elif page == "ℹ️ About":
         show_about_page()
@@ -540,6 +624,11 @@ def show_home_page(df, movie_df):
            - Matrix factorization
            - Learns latent factors
            - Best personalization (requires PySpark)
+        
+        4. **BiVAE (Deep Learning)** 🧠
+           - Bilateral Variational Autoencoder
+           - Deep learning based collaborative filtering
+           - Excellent personalization (requires cornac)
         """)
     
     with col2:
@@ -633,7 +722,7 @@ def show_home_page(df, movie_df):
             st.markdown(f"**Movie {row[COL_ITEM]}** - ⭐ {row['rating_avg']:.2f} ({int(row['rating_count'])} ratings)")
 
 
-def show_recommendations_page(train_df, test_df, df, movie_df, als_model=None):
+def show_recommendations_page(train_df, test_df, df, movie_df, als_model=None, bivae_predictions=None):
     """Display recommendations page."""
     
     st.markdown("## 🎯 Get Personalized Recommendations")
@@ -642,6 +731,8 @@ def show_recommendations_page(train_df, test_df, df, movie_df, als_model=None):
     available_algorithms = ["Popularity-Based", "Item-KNN (SAR)"]
     if SPARK_AVAILABLE:
         available_algorithms.append("ALS (Matrix Factorization)")
+    if bivae_predictions is not None:
+        available_algorithms.append("BiVAE (Deep Learning)")
     
     algorithm = st.selectbox(
         "Choose Algorithm:",
@@ -688,7 +779,7 @@ def show_recommendations_page(train_df, test_df, df, movie_df, als_model=None):
                     pop_model = train_popularity_model(train_df)
                     recs = pop_model.recommend_for_user(selected_user, top_k=num_recs)
                     
-            else:  # ALS
+            elif algorithm == "ALS (Matrix Factorization)":
                 if als_model is None:
                     st.error("ALS model is not available. Please ensure PySpark is installed and the model trained successfully.")
                     st.stop()
@@ -718,6 +809,27 @@ def show_recommendations_page(train_df, test_df, df, movie_df, als_model=None):
                     recs = recs_spark.toPandas()
                     recs = recs.rename(columns={COL_PREDICTION: 'score'})
                     recs['rank'] = range(1, len(recs) + 1)
+                else:
+                    st.warning(f"User {selected_user} has no ratings in training set. Showing popular items instead.")
+                    pop_model = train_popularity_model(train_df)
+                    recs = pop_model.recommend_for_user(selected_user, top_k=num_recs)
+            
+            else:  # BiVAE (Deep Learning)
+                if bivae_predictions is None:
+                    st.error("BiVAE predictions are not available. Please ensure the model is trained and loaded.")
+                    st.stop()
+                
+                # Get user's history for context
+                user_history = train_df[train_df[COL_USER] == selected_user]
+                
+                if len(user_history) > 0:
+                    # Get recommendations from pre-computed BiVAE predictions
+                    recs = get_bivae_recommendations_for_user(bivae_predictions, selected_user, top_k=num_recs)
+                    
+                    if recs is None or len(recs) == 0:
+                        st.warning(f"User {selected_user} not found in BiVAE predictions. Showing popular items instead.")
+                        pop_model = train_popularity_model(train_df)
+                        recs = pop_model.recommend_for_user(selected_user, top_k=num_recs)
                 else:
                     st.warning(f"User {selected_user} has no ratings in training set. Showing popular items instead.")
                     pop_model = train_popularity_model(train_df)
@@ -886,7 +998,7 @@ def show_recommendations_page(train_df, test_df, df, movie_df, als_model=None):
             st.info(f"User {selected_user} has no ratings in the dataset.")
 
 
-def show_evaluation_page(train_df, test_df, als_model=None):
+def show_evaluation_page(train_df, test_df, als_model=None, bivae_predictions=None):
     """Display evaluation page."""
     
     st.markdown("## 📊 Model Evaluation & Comparison")
@@ -950,6 +1062,26 @@ def show_evaluation_page(train_df, test_df, als_model=None):
             st.warning("⚠️ ALS model not available. Skipping ALS evaluation.")
         else:
             st.info("ℹ️ ALS evaluation skipped (PySpark not installed)")
+        
+        # Evaluate BiVAE if available
+        if bivae_predictions is not None:
+            with st.spinner('Evaluating BiVAE model...'):
+                try:
+                    with Timer() as pred_time:
+                        # BiVAE predictions are already computed, just filter for top-K
+                        bivae_topk = bivae_predictions.groupby(COL_USER).apply(
+                            lambda x: x.nlargest(TOP_K, COL_PREDICTION)
+                        ).reset_index(drop=True)
+                    
+                    bivae_results = evaluate_model(test_df, bivae_topk, "BiVAE")
+                    bivae_results['pred_time'] = pred_time.interval
+                    results.append(bivae_results)
+                    
+                    st.success(f"✅ BiVAE: MAP@{TOP_K}={bivae_results['map']:.4f}, NDCG@{TOP_K}={bivae_results['ndcg']:.4f}")
+                except Exception as e:
+                    st.warning(f"⚠️ BiVAE evaluation failed: {str(e)}")
+        else:
+            st.info("ℹ️ BiVAE evaluation skipped (predictions not loaded)")
         
         # Results table
         st.markdown("### 📋 Results Summary")
@@ -1064,6 +1196,14 @@ def show_about_page():
     - **Pros**: Best personalization, handles sparsity well
     - **Cons**: Computationally expensive, requires PySpark
     - **Status**: Available (requires PySpark installation)
+    
+    #### 4. BiVAE (Bilateral Variational Autoencoder)
+    - **Type**: Deep learning / Variational autoencoder
+    - **Approach**: Learns latent representations using neural networks for both users and items
+    - **Pros**: State-of-the-art accuracy, handles complex patterns, symmetric modeling
+    - **Cons**: Requires pre-training, computationally intensive
+    - **Status**: Available (requires cornac library)
+    - **Reference**: Truong et al. "Bilateral Variational Autoencoder for Collaborative Filtering" (WSDM 2021)
     
     ### 📊 Evaluation Metrics
     
