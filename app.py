@@ -35,7 +35,7 @@ st.set_page_config(
 
 # Constants
 TOP_K = 10
-MOVIELENS_DATA_SIZE = '20m'  # Start with 100k for faster demo, can change to 20m
+MOVIELENS_DATA_SIZE = '100k'  # Start with 100k for faster demo, can change to 20m
 COL_USER = "UserId"
 COL_ITEM = "MovieId"
 COL_RATING = "Rating"
@@ -51,7 +51,7 @@ PLACEHOLDER_IMAGE_URL = "https://via.placeholder.com/185x278/FF6B6B/FFFFFF?text=
 
 # Pre-computed predictions configuration
 BIVAE_PREDICTIONS_PATH = "./saved_models/bivae_predictions.pkl"  # Path to saved BiVAE predictions
-ALS_PREDICTIONS_PATH = "./top_all_recommendations.parquet"  # Path to saved ALS predictions (parquet directory)
+ALS_PREDICTIONS_PATH = "all_prediction_als.parquet/all_prediction_als.parquet"  # Path to saved ALS predictions (parquet directory)
 
 # Custom CSS
 st.markdown("""
@@ -129,10 +129,10 @@ def get_genre_emoji(genre):
 
 @st.cache_data(ttl=3600)
 def get_movie_details(title, year):
-    """Fetch movie details including cast and crew from TMDb API."""
+    """Fetch movie details including cast, crew, and overview from TMDb API."""
     try:
         if not TMDB_API_KEY:
-            return None, None
+            return None, None, None
         
         # Search for movie on TMDb
         search_url = f"https://api.themoviedb.org/3/search/movie"
@@ -147,6 +147,7 @@ def get_movie_details(title, year):
             results = response.json().get('results', [])
             if results:
                 movie_id = results[0]['id']
+                overview = results[0].get('overview', None)
                 
                 # Get movie credits (cast and crew)
                 credits_url = f"https://api.themoviedb.org/3/movie/{movie_id}/credits"
@@ -164,11 +165,11 @@ def get_movie_details(title, year):
                     crew = credits.get('crew', [])
                     directors = [person['name'] for person in crew if person['job'] == 'Director']
                     
-                    return actors, directors
+                    return actors, directors, overview
         
-        return None, None
+        return None, None, None
     except:
-        return None, None
+        return None, None, None
 
 
 def prefetch_movie_details(movies_list):
@@ -182,8 +183,8 @@ def prefetch_movie_details(movies_list):
     
     def fetch_single_movie(movie_info):
         title, year, movie_id = movie_info
-        actors, directors = get_movie_details(title, year)
-        return movie_id, (actors, directors)
+        actors, directors, overview = get_movie_details(title, year)
+        return movie_id, (actors, directors, overview)
     
     # Create list of movies to fetch
     with ThreadPoolExecutor(max_workers=10) as executor:
@@ -403,7 +404,7 @@ def load_als_predictions():
     Returns a DataFrame with columns: UserId, MovieId, prediction
     """
     try:
-        all_predictions = pd.read_parquet(ALS_PREDICTIONS_PATH)
+        all_predictions = pd.read_parquet(ALS_PREDICTIONS_PATH, engine="fastparquet")
         return all_predictions
     except FileNotFoundError:
         return None
@@ -834,11 +835,8 @@ def show_recommendations_page(train_df, test_df, df, movie_df, als_predictions=N
             avg_rating = row.get('avg_rating', 0)
             year = row.get('year', 'Unknown')
             
-            # Main container
-            st.markdown(f"#### #{rank}")
-            
             # Create columns with poster on the left
-            poster_col, col1, col2, col3 = st.columns([1, 3, 2, 1])
+            poster_col, col1, col2 = st.columns([1, 3, 2], vertical_alignment="top")
             
             # Display movie poster
             with poster_col:
@@ -849,14 +847,11 @@ def show_recommendations_page(train_df, test_df, df, movie_df, als_predictions=N
                     st.image(PLACEHOLDER_IMAGE_URL, use_container_width=True)
             
             with col1:
-                # Full title with year - large font
+                # Full title with rank - large font with negative margin to align with poster
                 full_title = row.get('title', title_clean)
-                if year != 'Unknown' and str(year) != 'nan':
-                    st.markdown(f"## {full_title}")
-                else:
-                    st.markdown(f"## {full_title}")
+                st.markdown(f"<h2 style='margin-top: -15px;'>{full_title}</h2>", unsafe_allow_html=True)
                 
-                # Genres with badges - medium font
+                # Genres with badges - smaller font
                 genres = row.get('genres', 'Unknown')
                 if pd.notna(genres) and genres not in ['Unknown', '']:
                     genre_list = str(genres).split('|')
@@ -866,28 +861,29 @@ def show_recommendations_page(train_df, test_df, df, movie_df, als_predictions=N
                         genre_name = g.strip()
                         emoji = get_genre_emoji(genre_name)
                         genre_badges.append(f"{emoji} {genre_name}")
-                    st.markdown(f"### {' · '.join(genre_badges)}")
+                    st.markdown(f"{' · '.join(genre_badges)}")
                 else:
-                    st.markdown("### 🎭 No genres available")
+                    st.markdown("🎭 No genres available")
                 
-                # Get cast and crew information from prefetched cache
+                # Get cast, crew, and overview information from prefetched cache
                 movie_id = row[COL_ITEM]
-                actors, directors = movie_details_cache.get(movie_id, (None, None))
+                actors, directors, overview = movie_details_cache.get(movie_id, (None, None, None))
                 
-                # Display directors - medium font
+                # Display directors - smaller font
                 if directors:
-                    st.markdown(f"### 🎬 Director: {', '.join(directors)}")
+                    st.markdown(f"🎬 Director: {', '.join(directors)}")
                 
-                # Display starring actors - medium font
+                # Display starring actors - smaller font
                 if actors:
-                    st.markdown(f"### ⭐ Starring: {', '.join(actors)}")
+                    st.markdown(f"⭐ Starring: {', '.join(actors)}")
             
             with col2:
-                # Statistics in metrics
+                # Statistics in metrics - right aligned
+                st.markdown("<style>div[data-testid='metric-container'] {text-align: right;}</style>", unsafe_allow_html=True)
                 stat_col1, stat_col2 = st.columns(2)
                 with stat_col1:
                     if avg_rating > 0:
-                        st.metric("Avg Rating", f"⭐ {avg_rating:.1f}/5")
+                        st.metric("Avg Rating", f"{avg_rating:.2f}/5")
                     else:
                         st.metric("Avg Rating", "N/A")
                 
@@ -897,18 +893,10 @@ def show_recommendations_page(train_df, test_df, df, movie_df, als_predictions=N
                         st.metric("# Ratings", f"{int(num_ratings):,}")
                     else:
                         st.metric("# Ratings", "N/A")
-                
-                # Year - medium font
-                if year != 'Unknown' and str(year) != 'nan':
-                    st.markdown(f"### 📅 Released: {year}")
-                else:
-                    st.markdown("### 📅 Year: Unknown")
             
-            with col3:
-                # Recommendation score
-                score = row.get('score', 0)
-                st.metric("Rec Score", f"{score:.3f}")
-                st.caption(f"ID: {row[COL_ITEM]}")
+            # Display overview/description spanning full width below the columns
+            if overview:
+                st.markdown(f"{overview}")
             
             st.markdown("---")
         
@@ -957,7 +945,7 @@ def show_recommendations_page(train_df, test_df, df, movie_df, als_predictions=N
                     
                     avg_rating = row.get('avg_rating', 0)
                     if avg_rating > 0:
-                        st.markdown(f"### 📊 Avg: {avg_rating:.1f}/5")
+                        st.markdown(f"### 📊 Avg: {avg_rating:.2f}/5")
                 
                 st.markdown("---")
         else:
